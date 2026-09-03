@@ -17,9 +17,9 @@ API_KEY_2CAPTCHA = os.getenv("API_KEY_2CAPTCHA")
 if not API_KEY_2CAPTCHA:
     raise ValueError("❌ Missing API_KEY_2CAPTCHA in .env file.")
 
-API_KEY = os.getenv("P-Key")
+API_KEY = os.getenv("P_Key")
 if not API_KEY:
-    raise ValueError("❌ Missing P-Key in .env file.")
+    raise ValueError("❌ Missing P_Key in .env file.")
 
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 4))
 
