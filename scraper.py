@@ -14,27 +14,37 @@ load_dotenv()
 OUTPUT_JSON_BASE = "notices"
 DOWNLOAD_DIR_BASE = "downloaded_files"
 
-# ---------- Helper: Normalise date strings ----------
+# ---------- Improved date normalisation ----------
 def normalize_date(date_str: str) -> str:
-    """Convert various date formats to YYYY-MM-DD."""
+    """Convert various date formats to YYYY-MM-DD, handling month names."""
     date_str = date_str.strip()
-    # Replace common separators with '/'
-    date_str = re.sub(r'[-.]', '/', date_str)
-    # Try dd/mm/yyyy
-    try:
-        dt = datetime.strptime(date_str, "%d/%m/%Y")
-        return dt.strftime("%Y-%m-%d")
-    except ValueError:
-        pass
-    # Remove letters (month names) and try again
-    cleaned = re.sub(r'[a-zA-Z]', '', date_str)   # remove letters
-    cleaned = re.sub(r'[/-]+', '/', cleaned)       # collapse separators
-    try:
-        dt = datetime.strptime(cleaned, "%d/%m/%Y")
-        return dt.strftime("%Y-%m-%d")
-    except ValueError:
-        pass
-    # Fallback: return original
+    if not date_str:
+        return date_str
+
+    # Map month names to numbers
+    months = {
+        'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
+        'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
+        'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
+    }
+    # Replace month names with numbers (case-insensitive)
+    lower = date_str.lower()
+    for name, num in months.items():
+        if name in lower:
+            date_str = lower.replace(name, num)
+            break
+    # Replace all non-digit characters except slash with slash
+    date_str = re.sub(r'[^0-9/]', '/', date_str)
+    # Remove duplicate slashes
+    date_str = re.sub(r'/+', '/', date_str)
+    # Try common formats
+    for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d/%m/%y", "%m/%d/%y"):
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    # Fallback: return cleaned string
     return date_str
 
 # ---------- 2Captcha solver ----------
@@ -182,14 +192,16 @@ class GSTNoticesDownloader:
         downloaded_files = []
 
         for i, row in enumerate(rows):
-            # Date filter – normalised
+            # Date filter with normalisation
             if self.target_date:
                 cells = row.locator('td').all()
                 if len(cells) >= 5:
                     date_issue = cells[3].inner_text().strip()
                     due_date = cells[4].inner_text().strip()
                     target_norm = normalize_date(self.target_date)
-                    if target_norm not in (normalize_date(date_issue), normalize_date(due_date)):
+                    issue_norm = normalize_date(date_issue)
+                    due_norm = normalize_date(due_date)
+                    if target_norm not in (issue_norm, due_norm):
                         continue
 
             view_link = row.locator('a[ng-click*="clickView(detail)"], a[ng-click*="dwnldSuppDoc"], a:has-text("View")')
@@ -198,7 +210,7 @@ class GSTNoticesDownloader:
 
             print(f"   🔍 Processing notice #{i+1}...")
 
-            # 1) Try direct download
+            # 1) Direct download attempt
             try:
                 with page.expect_download(timeout=10000) as download_info:
                     view_link.click()
@@ -440,6 +452,8 @@ class GSTNoticesDownloader:
                     close_metadata_modal(page)
                     try:
                         page.wait_for_selector('table', state='visible', timeout=20000)
+                        # Extra wait for data to populate (AJAX)
+                        page.wait_for_timeout(3000)
                     except PlaywrightTimeoutError:
                         # Check for "No data" message
                         no_data = page.locator('text="No data available"')
@@ -453,6 +467,7 @@ class GSTNoticesDownloader:
                         # Try closing modal and retry once
                         close_metadata_modal(page)
                         page.wait_for_selector('table', state='visible', timeout=10000)
+                        page.wait_for_timeout(2000)
                     print("📄 Notice Page Loaded successfully!")
 
                     # ---- Scrape all pages ----
@@ -467,16 +482,24 @@ class GSTNoticesDownloader:
                             headers = current_headers
                             print(f"      Headers: {headers}")
 
+                        # ---- Debug: show total rows before filter ----
+                        print(f"      DEBUG: Total rows before filter: {len(current_rows)}")
+
                         # ---- Date filter with normalisation ----
                         if self.target_date is not None:
                             target_norm = normalize_date(self.target_date)
+                            print(f"      DEBUG: target_norm = '{target_norm}'")
                             filtered_rows = []
                             for row in current_rows:
                                 if len(row) >= 5:
-                                    date_issue_norm = normalize_date(row[3].strip())
-                                    due_date_norm = normalize_date(row[4].strip())
-                                    if target_norm == date_issue_norm or target_norm == due_date_norm:
+                                    raw_issue = row[3].strip()
+                                    raw_due = row[4].strip()
+                                    issue_norm = normalize_date(raw_issue)
+                                    due_norm = normalize_date(raw_due)
+                                    print(f"      DEBUG: raw_issue='{raw_issue}' → '{issue_norm}', raw_due='{raw_due}' → '{due_norm}'")
+                                    if target_norm == issue_norm or target_norm == due_norm:
                                         filtered_rows.append(row)
+                                        print("      DEBUG: ✅ MATCH FOUND!")
                             current_rows = filtered_rows
                             print(f"      Filtered to {len(current_rows)} rows matching date {self.target_date}")
 
