@@ -2,18 +2,43 @@ import os
 import json
 import time
 import base64
+import re
+from datetime import datetime
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Same constants as original
+# Constants
 OUTPUT_JSON_BASE = "notices"
 DOWNLOAD_DIR_BASE = "downloaded_files"
 
+# ---------- Helper: Normalise date strings ----------
+def normalize_date(date_str: str) -> str:
+    """Convert various date formats to YYYY-MM-DD."""
+    date_str = date_str.strip()
+    # Replace common separators with '/'
+    date_str = re.sub(r'[-.]', '/', date_str)
+    # Try dd/mm/yyyy
+    try:
+        dt = datetime.strptime(date_str, "%d/%m/%Y")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    # Remove letters (month names) and try again
+    cleaned = re.sub(r'[a-zA-Z]', '', date_str)   # remove letters
+    cleaned = re.sub(r'[/-]+', '/', cleaned)       # collapse separators
+    try:
+        dt = datetime.strptime(cleaned, "%d/%m/%Y")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    # Fallback: return original
+    return date_str
+
+# ---------- 2Captcha solver ----------
 def solve_captcha(b64_image, api_key):
-    # (unchanged from original)
     print(f"   ⏳ Sending screenshot to 2Captcha...")
     payload = {
         'method': 'base64',
@@ -39,7 +64,6 @@ def solve_captcha(b64_image, api_key):
     raise Exception("Timeout waiting for captcha solution.")
 
 def close_metadata_modal(page):
-    # (unchanged)
     try:
         modal = page.locator('#caNumpopupV')
         if modal.is_visible():
@@ -49,25 +73,22 @@ def close_metadata_modal(page):
     except:
         pass
 
+# ---------- Main scraper class ----------
 class GSTNoticesDownloader:
     def __init__(self, username, password, api_key, target_date=None, job_id=None):
         self.username = username
         self.password = password
         self.api_key = api_key
         self.target_date = target_date
-        self.job_id = job_id or username  # fallback
+        self.job_id = job_id or username
         self.base_dir = os.path.join("data", self.job_id)
         self.download_dir = os.path.join(self.base_dir, DOWNLOAD_DIR_BASE)
         os.makedirs(self.download_dir, exist_ok=True)
         self.output_json = os.path.join(self.base_dir, f"{OUTPUT_JSON_BASE}.json")
-        self.collected_files = []  # will store all downloaded file paths
+        self.collected_files = []
 
-    # ---- Original methods (extract_table_data, close_details_modal, etc.) ----
-    # They remain exactly as in your script, but we'll adjust download_notices
-    # to collect file paths and return them.
-
+    # ----- Table extraction -----
     def extract_table_data(self, page):
-        # (unchanged)
         page.wait_for_selector('table', state='visible', timeout=15000)
         header_row = page.locator('table thead tr').first
         header_elements = header_row.locator('th').all()
@@ -85,13 +106,8 @@ class GSTNoticesDownloader:
                     rows.append(row_data[:len(headers)])
         return headers, rows
 
-    # Inside class GSTNoticesDownloader, add this method:
-
+    # ----- Verify login (used by /verify endpoint) -----
     def verify_login(self) -> tuple:
-        """
-        Attempts to log in and verifies that AuthToken and EntityRefId cookies are present.
-        Returns (True, "Login successful") or (False, "error message").
-        """
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
@@ -102,7 +118,6 @@ class GSTNoticesDownloader:
                 accept_downloads=True
             )
             page = context.new_page()
-
             try:
                 print("🌐 Navigating to GST login...")
                 page.goto('https://services.gst.gov.in/services/login', wait_until='domcontentloaded')
@@ -116,7 +131,6 @@ class GSTNoticesDownloader:
                 page.wait_for_selector('div[data-captcha] img#imgCaptcha', state='visible', timeout=15000)
                 time.sleep(1)
 
-                # Solve CAPTCHA
                 captcha_element = page.locator('div[data-captcha] img#imgCaptcha')
                 img_bytes = captcha_element.screenshot(type='png')
                 b64_image = base64.b64encode(img_bytes).decode('utf-8')
@@ -131,19 +145,14 @@ class GSTNoticesDownloader:
                 page.click('button[type="submit"]')
                 page.wait_for_load_state('networkidle', timeout=15000)
 
-                # Check for success (presence of Services dropdown)
                 try:
                     page.wait_for_selector('a.dropdown-toggle:has-text("Services")', state='visible', timeout=10000)
                     print("✅ Login Successful!")
-
-                    # Close any metadata modal
                     close_metadata_modal(page)
 
-                    # 🔥 IMPORTANT: Wait for cookies to be fully set (same as in original code)
                     print("⏳ Waiting 4 seconds for cookies to set...")
                     page.wait_for_timeout(4000)
 
-                    # Now retrieve cookies
                     cookies = context.cookies('https://services.gst.gov.in')
                     auth_cookie = next((c for c in cookies if c['name'] == 'AuthToken'), None)
                     ref_cookie = next((c for c in cookies if c['name'] == 'EntityRefId'), None)
@@ -156,7 +165,6 @@ class GSTNoticesDownloader:
                         if not ref_cookie: missing.append("EntityRefId")
                         return False, f"Cookies missing: {', '.join(missing)}"
                 except:
-                    # Check for error message
                     error_container = page.locator('div.err[data-ng-show="errors.login_error"]')
                     error_msg = error_container.inner_text().strip() if error_container.count() > 0 else "Unknown login error"
                     return False, f"Login failed: {error_msg}"
@@ -165,21 +173,23 @@ class GSTNoticesDownloader:
                 return False, f"Exception during login: {str(e)}"
             finally:
                 browser.close()
-    
+
+    # ----- Download notices (main download logic) -----
     def download_notices(self, page):
-        # Modified to collect file paths and return them.
         print("   ⬇️ Starting to download notices...")
         rows = page.locator('table tbody tr').all()
         downloaded_count = 0
-        downloaded_files = []  # local list
+        downloaded_files = []
 
         for i, row in enumerate(rows):
+            # Date filter – normalised
             if self.target_date:
                 cells = row.locator('td').all()
                 if len(cells) >= 5:
                     date_issue = cells[3].inner_text().strip()
                     due_date = cells[4].inner_text().strip()
-                    if self.target_date not in (date_issue, due_date):
+                    target_norm = normalize_date(self.target_date)
+                    if target_norm not in (normalize_date(date_issue), normalize_date(due_date)):
                         continue
 
             view_link = row.locator('a[ng-click*="clickView(detail)"], a[ng-click*="dwnldSuppDoc"], a:has-text("View")')
@@ -209,7 +219,7 @@ class GSTNoticesDownloader:
                 page.wait_for_load_state('domcontentloaded', timeout=15000)
                 page.wait_for_selector('.list-group', state='visible', timeout=10000)
                 page.wait_for_selector('.col-md-10', state='visible', timeout=10000)
-                self.process_notice_details(page, downloaded_files)  # pass list
+                self.process_notice_details(page, downloaded_files)
                 self.close_details_modal(page)
                 page.wait_for_selector('table', state='visible', timeout=10000)
                 downloaded_count += 1
@@ -220,8 +230,8 @@ class GSTNoticesDownloader:
         print(f"   ✅ Successfully processed {downloaded_count} notice(s).")
         return downloaded_files
 
+    # ----- Process detail tabs (attachments) -----
     def process_notice_details(self, page, file_list):
-        # Modified to append to file_list instead of only printing
         tabs = page.locator('.list-group a.list-group-item:not(.ng-hide)').all()
         if not tabs:
             print("      ⚠️ No sidebar tabs found.")
@@ -279,8 +289,8 @@ class GSTNoticesDownloader:
                 else:
                     print(f"         ⚠️ No attachment links found in row {row_idx+1}")
 
+    # ----- Close details modal -----
     def close_details_modal(self, page):
-        # (unchanged)
         close_selectors = [
             '.modal-header .close',
             '.modal-footer button[data-dismiss="modal"]',
@@ -305,8 +315,8 @@ class GSTNoticesDownloader:
             print("   ⚠️ No close button found. Trying to go back via browser history.")
             page.go_back()
 
+    # ----- Main entry point: full scrape and download -----
     def run_and_collect(self):
-        """Main entry point: runs the scraper and returns (headers, rows, file_paths)."""
         with sync_playwright() as p:
             max_attempts = 3
             browser = None
@@ -327,7 +337,7 @@ class GSTNoticesDownloader:
                     )
                     page = context.new_page()
 
-                    # ---- Login flow (unchanged) ----
+                    # ---- Login flow ----
                     print("🌐 Navigating to GST login...")
                     page.goto('https://services.gst.gov.in/services/login', wait_until='domcontentloaded')
                     page.wait_for_selector('form[name="loginform"]', state='attached', timeout=30000)
@@ -390,6 +400,7 @@ class GSTNoticesDownloader:
                     page.wait_for_load_state('domcontentloaded', timeout=30000)
                     current_url = page.url
 
+                    # Handle welcome page if shown
                     if "fowelcome" in current_url:
                         print("⚠️ Landed on welcome page. Attempting to proceed...")
                         proceed_selectors = [
@@ -424,12 +435,27 @@ class GSTNoticesDownloader:
 
                     print(f"✅ Final URL: {current_url}")
 
+                    # ---- Wait for table with fallback ----
                     print("📄 Waiting for Notice Table to load...")
-                    page.wait_for_selector('table', state='visible', timeout=20000)
                     close_metadata_modal(page)
+                    try:
+                        page.wait_for_selector('table', state='visible', timeout=20000)
+                    except PlaywrightTimeoutError:
+                        # Check for "No data" message
+                        no_data = page.locator('text="No data available"')
+                        if no_data.count() > 0:
+                            print("⚠️ No notices found for this account.")
+                            return [], [], []   # empty result
+                        # Check for error alert
+                        error_alert = page.locator('.alert-danger, .error-message')
+                        if error_alert.count() > 0:
+                            raise Exception("Page error: " + error_alert.inner_text())
+                        # Try closing modal and retry once
+                        close_metadata_modal(page)
+                        page.wait_for_selector('table', state='visible', timeout=10000)
                     print("📄 Notice Page Loaded successfully!")
 
-                    # ---- Scrape and download ----
+                    # ---- Scrape all pages ----
                     all_data = []
                     page_num = 1
                     headers = []
@@ -441,13 +467,15 @@ class GSTNoticesDownloader:
                             headers = current_headers
                             print(f"      Headers: {headers}")
 
+                        # ---- Date filter with normalisation ----
                         if self.target_date is not None:
+                            target_norm = normalize_date(self.target_date)
                             filtered_rows = []
                             for row in current_rows:
                                 if len(row) >= 5:
-                                    date_issue = row[3].strip()
-                                    due_date = row[4].strip()
-                                    if self.target_date in (date_issue, due_date):
+                                    date_issue_norm = normalize_date(row[3].strip())
+                                    due_date_norm = normalize_date(row[4].strip())
+                                    if target_norm == date_issue_norm or target_norm == due_date_norm:
                                         filtered_rows.append(row)
                             current_rows = filtered_rows
                             print(f"      Filtered to {len(current_rows)} rows matching date {self.target_date}")
@@ -465,7 +493,7 @@ class GSTNoticesDownloader:
                             print("      ✅ No more pages.")
                             break
 
-                    # Download notices and collect file paths
+                    # ---- Download notices ----
                     downloaded_files = self.download_notices(page)
 
                     # Save JSON data
@@ -477,7 +505,6 @@ class GSTNoticesDownloader:
                     print(f"   📋 Notice data saved to '{self.output_json}'")
                     print(f"   📂 Notice PDFs saved to '{self.download_dir}/'")
 
-                    # Return the results
                     return headers, all_data, downloaded_files
 
                 except Exception as e:
